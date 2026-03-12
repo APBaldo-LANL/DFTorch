@@ -626,9 +626,6 @@ class MDXLOS(MDXL):
             (self.Res_array, ResErr.detach().unsqueeze(0)), dim=0
         )
 
-        if md_step % dump_interval == 0:
-            comm_string = f"Etot = {Energ:.6f} eV, Epot = {self.EPOT:.6f} eV, Ekin = {self.EKIN:.6f} eV, T = {Temperature:.2f} K, NS = {structure.net_spin_sr.sum().item():.4f}, Res = {ResErr:.6f}\n"
-            write_XYZ_trajectory(traj_filename, structure, comm_string, step=md_step)
         self.VX = (
             self.VX
             + 0.5 * dt * (self.F2V * structure.f_tot[0] / structure.Mnuc)
@@ -997,6 +994,9 @@ class MDXLOS(MDXL):
             + 0.5 * dt * (self.F2V * structure.f_tot[2] / structure.Mnuc)
             - self.fric * self.VZ
         )
+        if md_step % dump_interval == 0:
+            comm_string = f"Etot = {Energ:.6f} eV, Epot = {self.EPOT:.6f} eV, Ekin = {self.EKIN:.6f} eV, T = {Temperature:.2f} K, NS = {structure.net_spin_sr.sum().item():.4f}, Res = {ResErr:.6f}\n"
+            write_XYZ_trajectory(traj_filename, structure, comm_string, n_tot_atom, n_spin_atom, step=md_step)
         if self.cuda_sync:
             torch.cuda.synchronize()
         print("F AND E: {:.3f} s".format(time.perf_counter() - tic4))
