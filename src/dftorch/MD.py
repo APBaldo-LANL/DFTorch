@@ -996,7 +996,7 @@ class MDXLOS(MDXL):
         )
         if md_step % dump_interval == 0:
             comm_string = f"Etot = {Energ:.6f} eV, Epot = {self.EPOT:.6f} eV, Ekin = {self.EKIN:.6f} eV, T = {Temperature:.2f} K, NS = {structure.net_spin_sr.sum().item():.4f}, Res = {ResErr:.6f}\n"
-            write_XYZ_trajectory(traj_filename, structure, comm_string, n_tot_atom, n_spin_atom, step=md_step)
+            write_XYZ_trajectory(traj_filename, structure, comm_string, q_tot_atom, q_spin_atom, step=md_step)
         if self.cuda_sync:
             torch.cuda.synchronize()
         print("F AND E: {:.3f} s".format(time.perf_counter() - tic4))
