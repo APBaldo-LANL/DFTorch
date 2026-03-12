@@ -2,6 +2,7 @@ from .ESDriver import ESDriverBatch
 from ._energy import energy_shadow
 from ._forces_batch import forces_shadow_batch
 from ._forces import forces_shadow, forces_shadow_pme, forces_spin
+from pathlib import Path
 
 # from ._kernel_fermi import _kernel_fermi
 from ._xl_tools import (
@@ -70,6 +71,15 @@ class MDXL:
         traj_filename="md_trj.xyz",
     ):
 
+
+        # rename md_trj.xyz if it already exists
+        cwd = Path.cwd()
+        newfile = cwd / traj_filename
+        backup = cwd / f"{traj_filename}.BAK"
+
+        if newfile.exists():
+            newfile.rename(backup)
+        ####
         if self.VX is None:
             self.VX, self.VY, self.VZ = initialize_velocities(
                 structure,
@@ -514,6 +524,16 @@ class MDXLOS(MDXL):
         dump_interval=1,
         traj_filename="md_trj.xyz",
     ):
+
+
+        # rename md_trj.xyz if it already exists
+        cwd = Path.cwd()
+        newfile = cwd / traj_filename
+        backup = cwd / f"{traj_filename}.BAK"
+
+        if newfile.exists():
+            newfile.rename(backup)
+        ####
 
         if self.VX is None:
             self.VX, self.VY, self.VZ = initialize_velocities(
@@ -995,7 +1015,7 @@ class MDXLOS(MDXL):
             - self.fric * self.VZ
         )
         if md_step % dump_interval == 0:
-            comm_string = f"Etot = {Energ:.6f} eV, Epot = {self.EPOT:.6f} eV, Ekin = {self.EKIN:.6f} eV, T = {Temperature:.2f} K, NS = {structure.net_spin_sr.sum().item():.4f}, Res = {ResErr:.6f}\n"
+            comm_string = f"Etot = {Energ:.6f} eV, Epot = {self.EPOT:.6f} eV, Ekin = {self.EKIN:.6f} eV, T = {Temperature:.2f} K, NS = {structure.net_spin_sr.sum().item():.4f}, Res = {ResErr:.6f}"
             write_XYZ_trajectory(traj_filename, structure, comm_string, q_tot_atom, q_spin_atom, step=md_step)
         if self.cuda_sync:
             torch.cuda.synchronize()
