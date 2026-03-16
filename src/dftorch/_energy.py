@@ -77,12 +77,25 @@ def energy(
     elif torch.get_default_dtype() == torch.float64:
         eps = 1e-10
 
+    # Ensure D0 is diagonal for consistent subtraction
+    if D0.ndim == 2:
+        D0_diag = torch.diag(D0)
+        print('D0 size')
+        print(D0_diag.size())
+    else:
+        D0_diag = torch.diag(D0)
+        print('D0 size')
+        print(D0_diag.size())
+
+    print('printing D size in Energy')
+    print(D.size())
     # Band energy
-    if Rx.dim() == 1:  # non-batched. both cs and os.
-        factor = 2 if D.dim() == 2 else 1  # closed-shell or open-shell
-        Eband0 = factor * (H0 @ D).diagonal(offset=0, dim1=-2, dim2=-1).sum()
-    else:  # batched
-        Eband0 = 2 * (H0 @ D).diagonal(offset=0, dim1=-2, dim2=-1).sum(-1)
+    if Rx.dim() == 1: # non-batched. both cs and os.
+        factor = 2 if D.dim() == 2 else 1 # closed-shell or open-shell
+        D = D - D0_diag.expand(2, -1, -1)
+        Eband0 = factor * (H0 @ D).diagonal(offset=0, dim1=-2, dim2=-1).sum() 
+    else: # batched
+        Eband0 = 2 * (H0 @ D).diagonal(offset=0, dim1=-2, dim2=-1).sum(-1) 
 
     # Coulomb energy
     if Rx.dim() == 1:  # non-batched
@@ -214,12 +227,27 @@ def energy_shadow(
     elif torch.get_default_dtype() == torch.float64:
         eps = 1e-10
 
+
+    # Ensure D0 is diagonal for consistent subtraction
+    if D0.ndim == 2:
+        D0_diag = torch.diag(D0)
+        print('D0 size')
+        print(D0_diag.size())
+    else:
+        D0_diag = torch.diag(D0)
+        print('D0 size')
+        print(D0_diag.size())
+    
+    print('printing D size in Energy')
+    print(D.size())
     # Band energy
-    if Rx.dim() == 1:  # non-batched. both cs and os.
-        factor = 2 if D.dim() == 2 else 1  # closed-shell or open-shell
+    if Rx.dim() == 1: # non-batched. both cs and os.
+        factor = 2 if D.dim() == 2 else 1 # closed-shell or open-shell
+        D = D - D0_diag.expand(2, -1, -1)
         Eband0 = factor * (H0 @ D).diagonal(offset=0, dim1=-2, dim2=-1).sum()
-    else:  # batched
+    else: # batched
         Eband0 = 2 * (H0 @ D).diagonal(offset=0, dim1=-2, dim2=-1).sum(-1)
+
 
     # Coulomb energy
     if Rx.dim() == 1:  # non-batched
