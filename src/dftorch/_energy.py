@@ -80,15 +80,9 @@ def energy(
     # Ensure D0 is diagonal for consistent subtraction
     if D0.ndim == 2:
         D0_diag = torch.diag(D0)
-        print('D0 size')
-        print(D0_diag.size())
     else:
         D0_diag = torch.diag(D0)
-        print('D0 size')
-        print(D0_diag.size())
 
-    print('printing D size in Energy')
-    print(D.size())
     # Band energy
     if Rx.dim() == 1: # non-batched. both cs and os.
         factor = 2 if D.dim() == 2 else 1 # closed-shell or open-shell
@@ -130,7 +124,8 @@ def energy(
     else:
         S_ent = -kB * term.sum(dim=-1)  # (B,)
 
-    E_entropy = -2 * Te * S_ent
+    factor = -2 if D.dim() == 2 else -1 # closed-shell or open-shell
+    E_entropy = factor * Te * S_ent
 
     # Total energy
     Etot = Eband0 + Ecoul + Edipole + E_entropy
@@ -231,15 +226,9 @@ def energy_shadow(
     # Ensure D0 is diagonal for consistent subtraction
     if D0.ndim == 2:
         D0_diag = torch.diag(D0)
-        print('D0 size')
-        print(D0_diag.size())
     else:
         D0_diag = torch.diag(D0)
-        print('D0 size')
-        print(D0_diag.size())
     
-    print('printing D size in Energy')
-    print(D.size())
     # Band energy
     if Rx.dim() == 1: # non-batched. both cs and os.
         factor = 2 if D.dim() == 2 else 1 # closed-shell or open-shell
@@ -284,7 +273,8 @@ def energy_shadow(
     else:
         S_ent = -kB * term.sum(dim=-1)  # (B,)
 
-    E_entropy = -2 * Te * S_ent
+    factor = -2 if D.dim() == 2 else -1 # closed-shell or open-shell
+    E_entropy = factor * Te * S_ent
 
     # Total energy
     Etot = Eband0 + Ecoul + Edipole + E_entropy
