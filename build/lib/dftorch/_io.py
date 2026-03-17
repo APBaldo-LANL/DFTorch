@@ -3,9 +3,10 @@ import numpy as np
 import re
 
 
-def write_XYZ_trajectory(filename, structure, comment, step=0, Ftot=None):
+def write_XYZ_trajectory(filename, structure, comment, charge, spin, step, Ftot=None):
     with open(filename, "a+") as f:
         num_atoms = structure.Nats
+        ns = spin[0] - spin[1]
         f.write(f"{structure.Nats}\n")
         f.write(f"Step {step}, {comment}\n")
         for i in range(num_atoms):
@@ -21,7 +22,9 @@ def write_XYZ_trajectory(filename, structure, comment, step=0, Ftot=None):
                     f"{symbol} {x:.6f} {y:.6f} {z:.6f} {fx:.6f} {fy:.6f} {fz:.6f}\n"
                 )
             else:
-                f.write(f"{symbol} {x:.6f} {y:.6f} {z:.6f}\n")
+                q = charge[i].item()
+                s = ns[i].item()
+                f.write(f"{symbol} {x:.6f} {y:.6f} {z:.6f} {q:.4f} {s:.4f}\n")
 
 
 def write_XYZ(filename, structure, comment, step=0, Ftot=None):

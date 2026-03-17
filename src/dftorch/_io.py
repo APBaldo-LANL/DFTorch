@@ -3,7 +3,7 @@ import numpy as np
 import re
 
 
-def write_XYZ_trajectory(filename, structure, comment, charge, spin, step=0, Ftot=None):
+def write_XYZ_trajectory(filename, structure, comment, charge, spin, step, Ftot=None):
     with open(filename, "a+") as f:
         num_atoms = structure.Nats
         ns = spin[0] - spin[1]
