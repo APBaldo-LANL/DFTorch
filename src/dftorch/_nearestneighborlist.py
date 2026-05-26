@@ -20,6 +20,26 @@ except ImportError:
 USE_ALCHEMI: bool = False
 
 
+def _pair_lookup_for_const(
+    TYPE: torch.Tensor, const, device: torch.device
+) -> torch.Tensor:
+    """Return the pair-type lookup matching the SKF row order stored in const."""
+    pair_lookup = getattr(const, "pair_lookup", None)
+    if pair_lookup is not None:
+        return pair_lookup.to(device=device)
+
+    pairs_tensor, _, _ = ordered_pairs_from_TYPE(TYPE.view(-1))
+    lookup_size = len(const.label)
+    pair_lookup = torch.full(
+        (lookup_size, lookup_size), -1, dtype=torch.long, device=device
+    )
+    if pairs_tensor.numel() > 0:
+        pair_lookup[pairs_tensor[:, 0], pairs_tensor[:, 1]] = torch.arange(
+            pairs_tensor.shape[0], dtype=torch.long, device=device
+        )
+    return pair_lookup
+
+
 # @torch.compile(dynamic=False)
 def vectorized_nearestneighborlist(
     TYPE: torch.Tensor,
@@ -212,16 +232,7 @@ def vectorized_nearestneighborlist(
         neighbor_J = neighbor_matrix[row_idx, col_idx].long()
 
         # ── Pair type lookup ──────────────────────────────────────────────
-        _, _, label_list = ordered_pairs_from_TYPE(TYPE)
-        pair_type_dict = {label_list[k]: k for k in range(len(label_list))}
-        labels = [s.strip() for s in const.label.tolist()]
-        label_to_idx = {lab: i for i, lab in enumerate(labels)}
-        Z = len(labels)
-        pair_lookup = torch.full((Z, Z), -1, dtype=torch.long, device=Rx.device)
-        for key, v in pair_type_dict.items():
-            a, b = key.split("-")
-            if a in label_to_idx and b in label_to_idx:
-                pair_lookup[label_to_idx[a], label_to_idx[b]] = v
+        pair_lookup = _pair_lookup_for_const(TYPE, const, Rx.device)
         ti = TYPE[neighbor_I].long()
         tj = TYPE[neighbor_J].long()
         IJ_pair_type = pair_lookup[ti, tj]
@@ -346,27 +357,7 @@ def vectorized_nearestneighborlist(
     del neighbor_mask, dist_vals
 
     ### Get tensors for SKF files ###
-    _, _, label_list = ordered_pairs_from_TYPE(TYPE)
-
-    pair_type_dict = {}
-
-    for i in range(len(label_list)):
-        pair_type_dict[label_list[i]] = i
-
-    # Build a 2D lookup table once (no function), then index it
-    labels = [
-        s.strip() for s in const.label.tolist()
-    ]  # fix spaces like ' P', 'V ', etc.
-    label_to_idx = {lab: i for i, lab in enumerate(labels)}
-    Z = len(labels)
-    pair_lookup = torch.full((Z, Z), -1, dtype=torch.long, device=Rx.device)
-    for k, v in pair_type_dict.items():  # keys like "C-H"
-        a, b = k.split("-")
-        ai = label_to_idx[a]
-        bi = label_to_idx[b]
-        pair_lookup[ai, bi] = int(v)
-        # If the mapping is symmetric and reverse might be missing, also do:
-        # pair_lookup[bi, ai] = int(v)
+    pair_lookup = _pair_lookup_for_const(TYPE, const, Rx.device)
     ti = TYPE[neighbor_I].long()
     tj = TYPE[neighbor_J].long()
     IJ_pair_type = pair_lookup[ti, tj]  # shape: (len(neighbor_I),)
@@ -617,20 +608,7 @@ def vectorized_nearestneighborlist_batch(
     neighbor_J_2d[b_s, k_in_batch] = j_s
 
     # Pair typing (unchanged)
-    TYPE_flat = TYPE.view(-1)
-    _, _, label_list = ordered_pairs_from_TYPE(TYPE_flat)
-    pair_type_dict = {label_list[i]: i for i in range(len(label_list))}
-    labels = [s.strip() for s in const.label.tolist()]
-    label_to_idx = {lab: i for i, lab in enumerate(labels)}
-    Z = len(labels)
-    pair_lookup = torch.full((Z, Z), -1, dtype=torch.long, device=device)
-    if pair_type_dict:
-        keys = list(pair_type_dict.keys())
-        splits = [k.split("-") for k in keys]
-        ai = torch.tensor([label_to_idx[a] for a, _ in splits], device=device)
-        bi = torch.tensor([label_to_idx[b] for _, b in splits], device=device)
-        vals = torch.tensor([pair_type_dict[k] for k in keys], device=device)
-        pair_lookup[ai, bi] = vals
+    pair_lookup = _pair_lookup_for_const(TYPE, const, device)
 
     ti_vals = TYPE[b_s, i_s]
     tj_vals = TYPE[b_s, j_s]

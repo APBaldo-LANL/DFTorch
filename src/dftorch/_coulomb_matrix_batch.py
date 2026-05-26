@@ -9,6 +9,7 @@ from ._coulomb_matrix import (
     _GAUSS_WIDTH_FACTOR,
     _H5_DEFAULT_SCALING,
     _VDW_RADII_PM,
+    _h_damp_base_power,
 )
 from ._tools import _maybe_compile
 
@@ -287,7 +288,7 @@ def ewald_real_space_vectorized_batch(
         Ui_au = Hubbard_U.gather(1, safe_I)[valid_pairs] * EV_TO_HA
         Uj_au = Hubbard_U.gather(1, safe_J)[valid_pairs] * EV_TO_HA
         r_au = dR_mskd * ANG_TO_BOHR
-        rTmp = -((0.5 * (Ui_au + Uj_au)) ** h_damp_exp)
+        rTmp = -_h_damp_base_power(0.5 * (Ui_au + Uj_au), h_damp_exp)
         D = torch.exp(rTmp * r_au**2)
         Dprime = 2.0 * rTmp * r_au * D * ANG_TO_BOHR
 

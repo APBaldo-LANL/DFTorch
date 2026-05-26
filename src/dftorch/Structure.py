@@ -587,5 +587,7 @@ class StructureBatch(torch.nn.Module):
         else:
             self.dU_dq = None
 
+        self.q = None
+
 
 __all__ = ["Structure", "StructureBatch"]

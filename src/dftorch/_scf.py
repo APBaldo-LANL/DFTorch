@@ -84,41 +84,39 @@ class _AndersonMixer:
         is_batch = getattr(self, "_batch_mode", False)
 
         if is_batch and R.ndim == 3:
-            # Batched: R is (m, B, N) → per-batch overlap (B, m, m)
-            # A[b, i, j] = R[i, b, :] · R[j, b, :]
-            A = torch.einsum("ibn,jbn->bij", R, R)  # (B, m, m)
-
-            # Tikhonov regularization per batch element
-            reg_eye = 1e-12 * torch.eye(m, device=q_in.device, dtype=q_in.dtype)
-            A_diag_max = A.diagonal(dim1=-2, dim2=-1).max(dim=-1).values  # (B,)
-            A = A + reg_eye.unsqueeze(0) * A_diag_max.clamp(min=1e-30).unsqueeze(
-                -1
-            ).unsqueeze(-1)
-
-            # Bordered system per batch element: (B, m+1, m+1)
-            Bmat = torch.zeros(
-                q_in.shape[0], m + 1, m + 1, device=q_in.device, dtype=q_in.dtype
-            )
-            Bmat[:, :m, :m] = A
-            Bmat[:, :m, m] = 1.0
-            Bmat[:, m, :m] = 1.0
-            rhs = torch.zeros(
-                q_in.shape[0], m + 1, device=q_in.device, dtype=q_in.dtype
-            )
-            rhs[:, m] = 1.0
-
-            try:
-                sol = torch.linalg.solve(Bmat, rhs)  # (B, m+1)
-            except torch.linalg.LinAlgError:
-                return q_in + self.alpha * residual
-
-            c = sol[:, :m]  # (B, m)
-
-            # Extrapolated update per batch: Σ_i c[b,i] * (Q[i,b,:] + α R[i,b,:])
             Q = torch.stack(list(self._q_hist))  # (m, B, N)
             mixed = Q + self.alpha * R  # (m, B, N)
-            # q_new[b, n] = Σ_i c[b, i] * mixed[i, b, n]
-            q_new = torch.einsum("bi,ibn->bn", c, mixed)
+            q_new = torch.empty_like(q_in)
+
+            # Solve each batch element independently. This matches the scalar
+            # DIIS path and avoids numerical pathologies seen with batched
+            # linear solves on heterogeneous SCC histories.
+            for batch_idx in range(q_in.shape[0]):
+                R_b = R[:, batch_idx, :].reshape(m, -1)
+                A_b = R_b @ R_b.T
+
+                reg = 1e-12 * torch.eye(m, device=q_in.device, dtype=q_in.dtype)
+                A_b = A_b + reg * A_b.diag().max().clamp(min=1e-30)
+
+                Bmat = torch.zeros(m + 1, m + 1, device=q_in.device, dtype=q_in.dtype)
+                Bmat[:m, :m] = A_b
+                Bmat[:m, m] = 1.0
+                Bmat[m, :m] = 1.0
+                rhs = torch.zeros(m + 1, device=q_in.device, dtype=q_in.dtype)
+                rhs[m] = 1.0
+
+                try:
+                    sol = torch.linalg.solve(Bmat, rhs)
+                except torch.linalg.LinAlgError:
+                    q_new[batch_idx] = (
+                        q_in[batch_idx] + self.alpha * residual[batch_idx]
+                    )
+                    continue
+
+                c = sol[:m]
+                q_new[batch_idx] = torch.einsum(
+                    "i,i...->...", c, mixed[:, batch_idx, :]
+                )
             return q_new
         else:
             # Non-batch or open-shell path (original)
@@ -1069,14 +1067,14 @@ def SCFx_batch(
             anderson_alpha = dftorch_params.get(
                 "ANDERSON_ALPHA", max(dftorch_params["SCF_ALPHA"], 0.2)
             )
-            _mixer = _AndersonMixer(
-                alpha=anderson_alpha,
-                depth=anderson_depth,
-            )
-            _mixer._batch_mode = True  # per-batch-element DIIS
+            _mixers = [
+                _AndersonMixer(alpha=anderson_alpha, depth=anderson_depth)
+                for _ in range(batch_size)
+            ]
         else:
-            _mixer = None
+            _mixers = None
 
+        scf_tol = dftorch_params.get("SCF_TOL", 1e-6)
         ResNorm = torch.zeros(batch_size, device=device) + 2.0  # float("inf")
         dEc = torch.zeros(batch_size, device=device) + 1000.0  # float("inf")
         it = 0
@@ -1084,8 +1082,7 @@ def SCFx_batch(
 
         print("\nStarting cycle")
         while (
-            (ResNorm > dftorch_params.get("SCF_TOL", 1e-6)).any()
-            or (dEc > dftorch_params.get("SCF_TOL", 1e-6) * 100).any()
+            (ResNorm > scf_tol).any() or (dEc > scf_tol * 100).any()
         ) and it < dftorch_params.get("SCF_MAX_ITER", 100):
             it += 1
             print("Iter {}".format(it))
@@ -1117,6 +1114,7 @@ def SCFx_batch(
             )
             Res = q - q_old
             ResNorm = torch.norm(Res, dim=1)
+            active_mask = (ResNorm > scf_tol) | (dEc > scf_tol * 100)
 
             # --- Charge mixing ---
             use_krylov = it > dftorch_params.get("KRYLOV_START", 10)
@@ -1149,14 +1147,19 @@ def SCFx_batch(
                     gbsa=gbsa_batch,
                     thirdorder=thirdorder_batch,
                 )
-                q = q_old - K0Res
-            elif _mixer is not None:
+                q_candidate = q_old - K0Res
+                q = torch.where(active_mask.unsqueeze(-1), q_candidate, q_old)
+            elif _mixers is not None:
                 # Anderson / DIIS mixing (pre-Krylov)
-                q = _mixer.mix(q_old, Res)
+                q = q_old.clone()
+                for batch_idx, mixer in enumerate(_mixers):
+                    if active_mask[batch_idx]:
+                        q[batch_idx] = mixer.mix(q_old[batch_idx], Res[batch_idx])
             else:
                 # Simple linear mixing fallback
                 K0Res = torch.matmul(KK, Res.unsqueeze(-1)).squeeze(-1)
-                q = q_old - K0Res
+                q_candidate = q_old - K0Res
+                q = torch.where(active_mask.unsqueeze(-1), q_candidate, q_old)
 
             Ecoul_old = Ecoul
 

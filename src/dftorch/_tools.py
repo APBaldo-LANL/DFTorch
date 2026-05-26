@@ -10,6 +10,11 @@ from ._elements import label, symbol_to_number
 
 _COMPILE_ENABLED = os.environ.get("DFTORCH_ENABLE_COMPILE", "0") != "0"
 
+# Pairs whose eigenvalue difference is smaller than this are treated as
+# degenerate: the 1/(lambda_i-lambda_j) term in the eigenvector gradient is
+# zeroed out to avoid NaN/inf in backward through symmetric eigendecompositions.
+DEGEN_THRESHOLD: float = float(torch.finfo(torch.float64).eps ** 0.6)
+
 
 def _maybe_compile(
     fn: Callable,
@@ -47,6 +52,39 @@ def _maybe_compile(
 # time; it can try to load optional Triton backends and emit warnings.
 
 
+class _degen_symeig(torch.autograd.Function):
+    """Symmetric eigensolver with a degenerate-safe backward."""
+
+    @staticmethod
+    def forward(ctx, A: torch.Tensor):
+        eival, eivec = torch.linalg.eigh(A, UPLO="U")
+        ctx.save_for_backward(eival, eivec)
+        return eival, eivec
+
+    @staticmethod
+    def backward(ctx, grad_eival, grad_eivec):
+        eival, eivec = ctx.saved_tensors
+        eivecT = eivec.transpose(-2, -1).conj()
+
+        if grad_eivec is not None:
+            delta = eival.unsqueeze(-2) - eival.unsqueeze(-1)
+            idx = torch.abs(delta) > DEGEN_THRESHOLD
+            proj = torch.matmul(eivecT, grad_eivec)
+            dC_proj = torch.zeros_like(proj)
+            dC_proj[idx] = proj[idx] / delta[idx]
+            CdCCT = torch.matmul(eivec, torch.matmul(dC_proj, eivecT))
+        else:
+            CdCCT = torch.zeros_like(eivec)
+
+        dA = CdCCT
+        if grad_eival is not None:
+            CdLCT = torch.matmul(eivec, grad_eival.unsqueeze(-1) * eivecT)
+            dA = dA + CdLCT
+
+        dA = (dA + dA.transpose(-2, -1).conj()) * 0.5
+        return dA
+
+
 def fractional_matrix_power_symm(A: torch.Tensor, power: float = -0.5) -> torch.Tensor:
     """
     Compute the fractional matrix power A**power for a (batch of) real symmetric
@@ -78,8 +116,9 @@ def fractional_matrix_power_symm(A: torch.Tensor, power: float = -0.5) -> torch.
     - Broadcasting supports arbitrary leading batch dimensions.
     - For poorly conditioned matrices, consider preconditioning before calling.
     """
-    # eigh handles symmetric real matrices; returns real eigenpairs
-    w, Q = torch.linalg.eigh(A)  # w (..., n), Q (..., n, n)
+    # Use the degenerate-safe eigensolver so repeated overlap eigenvalues do
+    # not poison gradients through the orthogonalizer.
+    w, Q = _degen_symeig.apply(A)  # w (..., n), Q (..., n, n)
 
     # clamp tiny/negative eigenvalues to keep things real/stable for negative powers
     eps = torch.finfo(A.dtype).eps

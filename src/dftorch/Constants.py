@@ -5,7 +5,7 @@ import torch
 
 from ._elements import atomic_num, label, mass, symbol_to_number
 from ._io import read_pdb, read_xyz
-from ._tools import load_hubbard_derivs, load_spinw_to_matrix
+from ._tools import load_hubbard_derivs, load_spinw_to_matrix, ordered_pairs_from_TYPE
 
 
 class Constants(torch.nn.Module):
@@ -81,6 +81,17 @@ class Constants(torch.nn.Module):
             else:
                 species, _ = read_xyz(files, sort=False)  # Input coordinate file
         TYPE = torch.tensor(species.flatten())
+        pairs_tensor, _, _ = ordered_pairs_from_TYPE(TYPE)
+        pair_lookup = torch.full(
+            (len(self.label), len(self.label)),
+            -1,
+            dtype=torch.long,
+            device=TYPE.device,
+        )
+        if pairs_tensor.numel() > 0:
+            pair_lookup[pairs_tensor[:, 0], pairs_tensor[:, 1]] = torch.arange(
+                pairs_tensor.shape[0], dtype=torch.long, device=TYPE.device
+            )
 
         from ._bond_integral import get_skf_tensors
 
@@ -132,11 +143,12 @@ class Constants(torch.nn.Module):
         self.coeffs_tensor = torch.nn.Parameter(coeffs_tensor, requires_grad=False)
         self.R_rep_tensor = torch.nn.Parameter(R_rep_tensor, requires_grad=False)
         self.rep_splines_tensor = torch.nn.Parameter(
-            rep_splines_tensor, requires_grad=False
+            rep_splines_tensor, requires_grad=self.grad_param
         )
         self.close_exp_tensor = torch.nn.Parameter(
             close_exp_tensor, requires_grad=False
         )
+        self.pair_lookup = torch.nn.Parameter(pair_lookup, requires_grad=False)
 
         self.n_orb = torch.nn.Parameter(N_ORB, requires_grad=False)
         self.max_ang = torch.nn.Parameter(
@@ -150,9 +162,9 @@ class Constants(torch.nn.Module):
         self.n_p = torch.nn.Parameter(N_P, requires_grad=False)
         self.n_d = torch.nn.Parameter(N_D, requires_grad=False)
 
-        self.U = torch.nn.Parameter(US, requires_grad=False)
-        self.Up = torch.nn.Parameter(UP, requires_grad=False)
-        self.Ud = torch.nn.Parameter(UD, requires_grad=False)
+        self.U = torch.nn.Parameter(US, requires_grad=self.grad_param)
+        self.Up = torch.nn.Parameter(UP, requires_grad=self.grad_param)
+        self.Ud = torch.nn.Parameter(UD, requires_grad=self.grad_param)
         self.Es = torch.nn.Parameter(ES, requires_grad=self.grad_param)
         self.Ep = torch.nn.Parameter(EP, requires_grad=self.grad_param)
         self.Ed = torch.nn.Parameter(ED, requires_grad=self.grad_param)

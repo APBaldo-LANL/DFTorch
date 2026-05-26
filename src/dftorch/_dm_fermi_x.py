@@ -4,56 +4,13 @@ from typing import Optional
 
 import torch
 
-from ._tools import _maybe_compile
-
-# Pairs whose eigenvalue difference is smaller than this are treated as
-# degenerate: the 1/(λᵢ−λⱼ) term in the eigenvector gradient is zeroed out
-# to avoid NaN/inf when backpropagating through symmetric/padded systems.
-DEGEN_THRESHOLD: float = float(torch.finfo(torch.float64).eps ** 0.6)  # ≈1.3e-10
+from ._tools import _degen_symeig, _maybe_compile
 
 
-class _degen_symeig(torch.autograd.Function):
-    """Batched symmetric eigensolver with degenerate-safe backward.
+def _fermi_occupations(beta: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Stable Fermi-Dirac occupations for x = h - mu."""
 
-    Forward: identical to ``torch.linalg.eigh``.
-
-    Backward: the ill-posed ``1/(λᵢ−λⱼ)`` terms are **zeroed out** when
-    ``|λᵢ−λⱼ| ≤ DEGEN_THRESHOLD``, preventing NaN/inf gradients through
-    degenerate eigenspaces (e.g. symmetric molecules or padded orbitals).
-
-    Handles both single ``(N, N)`` and batched ``(B, N, N)`` inputs.
-    Based on M. F. Kasim, arXiv:2011.04366 (2020).
-    """
-
-    @staticmethod
-    def forward(ctx, A: torch.Tensor):
-        eival, eivec = torch.linalg.eigh(A, UPLO="U")
-        ctx.save_for_backward(eival, eivec)
-        return eival, eivec
-
-    @staticmethod
-    def backward(ctx, grad_eival, grad_eivec):
-        eival, eivec = ctx.saved_tensors
-        eivecT = eivec.transpose(-2, -1).conj()
-
-        if grad_eivec is not None:
-            # (..., N, N) difference matrix — works for both batched and single
-            delta = eival.unsqueeze(-2) - eival.unsqueeze(-1)
-            idx = torch.abs(delta) > DEGEN_THRESHOLD
-            delta_inv = torch.zeros_like(delta)
-            delta_inv[idx] = delta[idx].reciprocal()
-            dC_proj = delta_inv * torch.matmul(eivecT, grad_eivec)
-            CdCCT = torch.matmul(eivec, torch.matmul(dC_proj, eivecT))
-        else:
-            CdCCT = torch.zeros_like(eivec)
-
-        dA = CdCCT
-        if grad_eival is not None:
-            CdLCT = torch.matmul(eivec, grad_eival.unsqueeze(-1) * eivecT)
-            dA = dA + CdLCT
-
-        dA = (dA + dA.transpose(-2, -1).conj()) * 0.5
-        return dA
+    return torch.sigmoid(-beta * x)
 
 
 def dm_fermi_x(
@@ -133,7 +90,7 @@ def dm_fermi_x(
     cnt = 0
     while (occ_err_val > eps) and (cnt < MaxIt):
         # Clamp small eigvals if needed by your physics; leave as-is here.
-        f = 1.0 / (torch.exp(beta * (h - mu0)) + 1.0)  # occupations (N,)
+        f = _fermi_occupations(beta, h - mu0)  # occupations (N,)
 
         dOcc = beta * torch.sum(f * (1.0 - f))
         Occ = torch.sum(f)
@@ -186,15 +143,12 @@ def dm_fermi_x_os(
 
     h, v = torch.linalg.eigh(H0)
     if mu_0 is None:
-        # h = torch.linalg.eigvalsh(H0)
-        # h,v = torch.linalg.eigh(H0.to(torch.float64))
-        # h = h.to(H0.dtype)
-        # v = v.to(H0.dtype)
-
-        lumo = nocc.unsqueeze(0).T
-        if broken_symmetry:
+        n_orb = h.shape[1]
+        homo = torch.clamp(nocc - 1, min=0, max=n_orb - 1).unsqueeze(1)
+        lumo = torch.clamp(nocc, min=0, max=n_orb - 1).unsqueeze(1)
+        if broken_symmetry and 0 < nocc[0] < n_orb:
             v[0, :, nocc[0] - 1] = 0.9 * v[0, :, nocc[0] - 1] + 0.1 * v[0, :, nocc[0]]
-        mu0 = 0.5 * (h.gather(1, lumo) + h.gather(1, lumo - 1)).reshape(-1)
+        mu0 = 0.5 * (h.gather(1, lumo) + h.gather(1, homo)).reshape(-1)
     else:
         mu0 = torch.as_tensor(mu_0, dtype=h.dtype, device=h.device)
 
@@ -206,7 +160,7 @@ def dm_fermi_x_os(
     cnt = 0
     while (occ_err_val > eps).any() and (cnt < MaxIt):
         # Clamp small eigvals if needed by your physics; leave as-is here.
-        f = 1.0 / (torch.exp(beta * (h - mu0.unsqueeze(-1))) + 1.0)  # occupations (N,)
+        f = _fermi_occupations(beta, h - mu0.unsqueeze(-1))  # occupations (N,)
 
         # dOcc and Occ are scalar tensors; convert to Python floats for loop control.
         dOcc = beta * torch.sum(f * (1.0 - f), dim=1)
@@ -257,15 +211,15 @@ def dm_fermi_x_os_shared(
     h_all = h.flatten().sort()[0]
     target_occ = nocc.sum()
     if mu_0 is None:
-        # h = torch.linalg.eigvalsh(H0)
-
-        lumo = target_occ
-        if broken_symmetry:
+        max_idx = h_all.shape[0] - 1
+        homo = torch.clamp(target_occ - 1, min=0, max=max_idx)
+        lumo = torch.clamp(target_occ, min=0, max=max_idx)
+        if broken_symmetry and 0 < nocc[0] < h.shape[1]:
             mix_coeff = 0.02
             v[0, :, nocc[0] - 1] = (1 - mix_coeff) * v[
                 0, :, nocc[0] - 1
             ] + mix_coeff * v[0, :, nocc[0]]
-        mu0 = 0.5 * (h_all[lumo] + h_all[lumo - 1])
+        mu0 = 0.5 * (h_all[lumo] + h_all[homo])
     else:
         mu0 = torch.as_tensor(mu_0, dtype=h.dtype, device=h.device)
 
@@ -278,7 +232,7 @@ def dm_fermi_x_os_shared(
 
     while (occ_err_val > eps).any() and (cnt < MaxIt):
         # Clamp small eigvals if needed by your physics; leave as-is here.
-        f = 1.0 / (torch.exp(beta * (h_all - mu0)) + 1.0)  # occupations (N,)
+        f = _fermi_occupations(beta, h_all - mu0)  # occupations (N,)
 
         # dOcc and Occ are scalar tensors; convert to Python floats for loop control.
         dOcc = beta * torch.sum(f * (1.0 - f))
@@ -299,7 +253,7 @@ def dm_fermi_x_os_shared(
                 MaxIt, occ_err_val
             )
         )
-    f = 1.0 / (torch.exp(beta * (h - mu0)) + 1.0)  # occupations (N,)
+    f = _fermi_occupations(beta, h - mu0)  # occupations (N,)
 
     # Final adjustment of occupation
     # P0 = v@(torch.diag_embed(f)@v.T)
@@ -349,7 +303,7 @@ def dm_fermi_x_batch(
     cnt = 0
     while (occ_err_val > eps).any() and (cnt < MaxIt):
         # Clamp small eigvals if needed by your physics; leave as-is here.
-        f = 1.0 / (torch.exp(beta * (h - mu0.unsqueeze(-1))) + 1.0)  # occupations (N,)
+        f = _fermi_occupations(beta, h - mu0.unsqueeze(-1))  # occupations (N,)
 
         # dOcc and Occ are scalar tensors; convert to Python floats for loop control.
         dOcc = beta * torch.sum(f * (1.0 - f), dim=1)
@@ -404,6 +358,12 @@ def dm_fermi_x_batch_degen(
     else:
         mu0 = torch.as_tensor(mu_0, dtype=h.dtype, device=h.device)
 
+    if T == 0:
+        orb_idx = torch.arange(h.shape[1], device=h.device).unsqueeze(0)
+        f = (orb_idx < nocc.unsqueeze(1)).to(h.dtype)
+        P0 = (v * f.unsqueeze(-2)) @ v.transpose(-2, -1)
+        return P0, v, h, f, mu0
+
     kB = torch.tensor(8.61739e-5, dtype=h.dtype, device=h.device)  # eV/K
     beta = 1.0 / (kB * T)
     occ_err_val = torch.zeros_like(
@@ -411,7 +371,7 @@ def dm_fermi_x_batch_degen(
     ) + float("inf")
     cnt = 0
     while (occ_err_val > eps).any() and (cnt < MaxIt):
-        f = 1.0 / (torch.exp(beta * (h - mu0.unsqueeze(-1))) + 1.0)
+        f = _fermi_occupations(beta, h - mu0.unsqueeze(-1))
         dOcc = beta * torch.sum(f * (1.0 - f), dim=1)
         Occ = torch.sum(f, dim=1)
         occ_err_val = abs(nocc - Occ)
@@ -472,7 +432,7 @@ def nonaufbau_constraints(
     h, v = torch.linalg.eigh(H0)
     kB = torch.tensor(8.61739e-5, dtype=h.dtype, device=h.device)  # eV/K
     beta = 1.0 / (kB * T)
-    f = 1.0 / (torch.exp(beta * (h - mu0.unsqueeze(-1))) + 1.0)  # occupations (N,)
+    f = _fermi_occupations(beta, h - mu0.unsqueeze(-1))  # occupations (N,)
 
     if state == "SINGLET":
         f[1, nocc - 1] = 0

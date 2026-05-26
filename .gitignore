@@ -17,6 +17,7 @@ experiments/*.vel
 experiments/batch_md/
 experiments/*.png
 experiments/*.dat
+experiments/*.py
 
 
 

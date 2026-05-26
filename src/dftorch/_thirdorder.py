@@ -33,6 +33,8 @@ from typing import Optional
 
 import torch
 
+from ._coulomb_matrix import _h_damp_base_power
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Low-level helper functions (translated from DFTB+ thirdorder.F90)
 # All inputs/outputs are in *atomic units* (Hartree, Bohr) unless noted.
@@ -168,21 +170,24 @@ def _gpTpR(tau: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
 # ── Damping functions h(U_A, U_B, r, ξ) and derivatives ─────────────────
 def _hh(Ua: torch.Tensor, Ub: torch.Tensor, r: torch.Tensor, xi: float) -> torch.Tensor:
     """Damping function h = exp(−((U_A+U_B)/2)^ξ · r²)."""
-    return torch.exp(-((0.5 * (Ua + Ub)) ** xi) * r**2)
+    avg = 0.5 * (Ua + Ub)
+    return torch.exp(-_h_damp_base_power(avg, xi) * r**2)
 
 
 def _hpU(
     Ua: torch.Tensor, Ub: torch.Tensor, r: torch.Tensor, xi: float
 ) -> torch.Tensor:
     """dh/dU_A."""
-    return -0.5 * xi * r**2 * (0.5 * (Ua + Ub)) ** (xi - 1.0) * _hh(Ua, Ub, r, xi)
+    avg = 0.5 * (Ua + Ub)
+    return -0.5 * xi * r**2 * _h_damp_base_power(avg, xi - 1.0) * _hh(Ua, Ub, r, xi)
 
 
 def _hpR(
     Ua: torch.Tensor, Ub: torch.Tensor, r: torch.Tensor, xi: float
 ) -> torch.Tensor:
     """dh/dr."""
-    return -2.0 * r * (0.5 * (Ua + Ub)) ** xi * _hh(Ua, Ub, r, xi)
+    avg = 0.5 * (Ua + Ub)
+    return -2.0 * r * _h_damp_base_power(avg, xi) * _hh(Ua, Ub, r, xi)
 
 
 def _hpUpR(
@@ -190,7 +195,9 @@ def _hpUpR(
 ) -> torch.Tensor:
     """d²h/dU_A·dr."""
     avg = 0.5 * (Ua + Ub)
-    return xi * r * avg ** (xi - 1.0) * (r**2 * avg**xi - 1.0) * _hh(Ua, Ub, r, xi)
+    avg_xi = _h_damp_base_power(avg, xi)
+    avg_xi_m1 = _h_damp_base_power(avg, xi - 1.0)
+    return xi * r * avg_xi_m1 * (r**2 * avg_xi - 1.0) * _hh(Ua, Ub, r, xi)
 
 
 # ── dγ/dU_A (on-site limit r=0 with U_A ≠ U_B) ─────────────────────────

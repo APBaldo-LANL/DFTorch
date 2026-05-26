@@ -77,6 +77,14 @@ _H5_DEFAULT_SCALING: Dict[int, float] = {
 # gaussianWidthFactor = 0.5 / sqrt(2 * ln(2))  ≈ 0.42466
 _GAUSS_WIDTH_FACTOR = 0.5 / math.sqrt(2.0 * math.log(2.0))
 
+_H_DAMP_BASE_EPS = 1.0e-20
+
+
+def _h_damp_base_power(base: torch.Tensor, exponent) -> torch.Tensor:
+    """Stable positive-base exponentiation for trainable H-damping exponents."""
+    base_safe = torch.clamp(base, min=_H_DAMP_BASE_EPS)
+    return torch.exp(exponent * torch.log(base_safe))
+
 
 def coulomb_matrix_vectorized(
     Hubbard_U: torch.Tensor,
@@ -382,7 +390,7 @@ def ewald_real_space_vectorized(
         Ui_au = Hubbard_U[neighbor_I] * EV_TO_HA
         Uj_au = Hubbard_U[neighbor_J] * EV_TO_HA
         r_au = dR_mskd * ANG_TO_BOHR
-        rTmp = -((0.5 * (Ui_au + Uj_au)) ** h_damp_exp)
+        rTmp = -_h_damp_base_power(0.5 * (Ui_au + Uj_au), h_damp_exp)
         D = torch.exp(rTmp * r_au**2)
         Dprime = 2.0 * rTmp * r_au * D * ANG_TO_BOHR  # d(D)/d(r_Ang)
 

@@ -4,6 +4,7 @@ import torch
 import numpy as np
 import time
 from typing import Optional, Tuple, Dict
+from .._coulomb_matrix import _h_damp_base_power
 from .util import CONV_FACTOR
 
 
@@ -580,7 +581,7 @@ def h_damp_h5_correction(
             Ui_au = hubbard_u.unsqueeze(1).expand_as(nbr_inds)[h_mask] * EV_TO_HA
             Uj_au = hubbard_u[nbr_inds.clamp(min=0)][h_mask] * EV_TO_HA
             r_au = MAGR[h_mask] * ANG_TO_BOHR
-            rTmp = -((0.5 * (Ui_au + Uj_au)) ** h_damp_exp)
+            rTmp = -_h_damp_base_power(0.5 * (Ui_au + Uj_au), h_damp_exp)
             D = torch.exp(rTmp * r_au**2)
             # γ_damped = γ * D
             J0_damped[h_mask] = J0_undamped[h_mask] * D
@@ -711,7 +712,7 @@ def h_damp_h5_correction(
             Ui_au_full = hubbard_u.unsqueeze(1).expand_as(nbr_inds) * EV_TO_HA
             Uj_au_full = hubbard_u[nbr_inds.clamp(min=0)] * EV_TO_HA
             r_au_full = MAGR * ANG_TO_BOHR
-            rTmp_full = -((0.5 * (Ui_au_full + Uj_au_full)) ** h_damp_exp)
+            rTmp_full = -_h_damp_base_power(0.5 * (Ui_au_full + Uj_au_full), h_damp_exp)
             D_full = torch.where(h_mask, torch.exp(rTmp_full * r_au_full**2), one)
             Dprime_ang_full = torch.where(
                 h_mask,
