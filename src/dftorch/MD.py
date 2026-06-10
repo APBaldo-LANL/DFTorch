@@ -64,6 +64,7 @@ class MDXL:
         self.barostat_compressibility = (
             4.57e-5  # compressibility in 1/GPa (water default)
         )
+        self.barostat_stochastic = False
         self.P_array = None  # pressure history
         self.V_array = None  # volume history
 
@@ -107,6 +108,7 @@ class MDXL:
     def _langevin_kick(self, structure, dt):
         """
         Apply Langevin friction + random force as a velocity correction.
+        Apply Langevin friction + random force as a velocity correction.
         Called once per half-step (splitting scheme).
 
         The impulse for_ half-step dt/2:
@@ -149,6 +151,7 @@ class MDXL:
         tau: float = 100.0,
         isotropic: bool = True,
         compressibility: float = 4.57e-5,
+        stochastic: bool = False,
     ):
         """
         Enable Berendsen barostat for_ NPT ensemble.
@@ -181,6 +184,8 @@ class MDXL:
         self.barostat_isotropic = isotropic
         # Convert compressibility from 1/bar → Å³/eV for_ internal use
         self.barostat_compressibility = compressibility * bar_per_eVA3  # Å³/eV
+        if stochastic:
+            self.barostat_stochastic = True
 
     def _compute_stress_tensor(self, structure, dftorch_params):
         """
@@ -229,6 +234,94 @@ class MDXL:
         sigma_kin = (2.0 * self.MVV2KE * mvv) / V
         return sigma_kin  # eV/Å³
 
+    def _stochastic_barostat_scale(self, structure, dt):
+        """
+        Apply Stochastic 'Berendsen' barostat scaling to cell and
+            positions.
+
+        Scaling factor:
+          μ = (β dt / (τ_P)) (P_target - P_inst) + [(2 kb T β) / (V τ_P)]^(1/2) dW
+
+          dW = Wiener noise
+
+        For non-scaled momenta:
+          P_inst = (N - 1 Kb T) / (V) - σ_pot
+        """
+        kB_eV = 8.617333262145e-5  # eV/K
+        T = (
+            self.temperature_K.item()
+            if hasattr(self.temperature_K, "item")
+            else float(self.temperature_K)
+        )
+        N = structure.Mnuc.size(0)
+        V = torch.abs(torch.det(structure.cell))
+        sigma_pot = self._compute_stress_tensor(structure, self._dftorch_params)
+        sigma_kin = torch.ones_like(sigma_pot)
+        #print('barostat T:', T)
+        #print('barostat N:', N)
+        #print('barostat sigma kinetic:', sigma_kin)
+        kin_factor = (N * kB_eV  * T) / V
+        sigma_kin = sigma_kin * kin_factor
+        #print('barostat sigma kinetic:', sigma_kin)
+        
+        P_inst = sigma_kin - sigma_pot
+
+        P_scalar = torch.trace(P_inst) / 3.0
+        GPa_per_eVA3 = 160.21766208
+
+        # Store for_ logging (GPa)
+        self._P_inst_GPa = P_scalar * GPa_per_eVA3
+        self._P_tensor = P_inst * GPa_per_eVA3
+
+        prefactor = -1.0 * self.barostat_compressibility * dt / self.barostat_tau
+        stochastic_factor = ( (2 * kB_eV * T * self.barostat_compressibility) / (V * self.barostat_tau) ) ** (1.0 / 2.0)
+
+        stochastic_term = stochastic_factor * torch.randn(1)
+        #print('stochastic_factor',stochastic_factor)
+        #print('stochastic_term',stochastic_term)
+
+        dP = self.target_pressure - P_scalar  # eV/Å³
+
+        mu = torch.exp(
+                (prefactor * dP) + stochastic_term
+                ) ** (1.0 / 3.0)
+
+        mu_t = torch.tensor(
+                mu, dtype=structure.cell.dtype, device=structure.cell.device
+            )
+
+        structure.cell = structure.cell * mu_t
+        structure.cell_inv = torch.linalg.inv(structure.cell)
+
+        structure.RX = structure.RX * mu_t
+        structure.RY = structure.RY * mu_t
+        structure.RZ = structure.RZ * mu_t
+
+        # Wrap positions after rescaling
+        R = torch.stack((structure.RX, structure.RY, structure.RZ), dim=-1)
+        R = wrap_positions(R, structure.cell, structure.cell_inv)
+        structure.RX, structure.RY, structure.RZ = R.unbind(dim=-1)
+
+        # Rebuild PME data for_ the new cell (if using PME Coulomb)
+        if self._dftorch_params["coul_method"] == "PME":
+            from .ewald_pme import (
+                init_PME_data,
+                calculate_alpha_and_num_grids,
+            )
+
+            self.CALPHA, grid_dimensions = calculate_alpha_and_num_grids(
+                structure.cell.detach().cpu().numpy(),
+                self._dftorch_params["cutoff"],
+                self._dftorch_params["Coulomb_acc"],
+            )
+            self.PME_data = init_PME_data(
+                grid_dimensions,
+                structure.cell,
+                self.CALPHA,
+                self._dftorch_params["PME_order"],
+            )
+
+
     def _barostat_scale(self, structure, dt):
         """
         Apply Berendsen barostat scaling to cell and positions.
@@ -244,6 +337,7 @@ class MDXL:
 
         # Pressure tensor: P = σ_kin - σ_pot
         P_inst = sigma_kin - sigma_pot  # (3, 3) eV/Å³
+        #P_inst = sigma_kin + sigma_pot  # (3, 3) eV/Å³
 
         P_scalar = torch.trace(P_inst) / 3.0
         GPa_per_eVA3 = 160.21766208
@@ -256,6 +350,7 @@ class MDXL:
         # β is in Å³/eV (converted from 1/bar in enable_barostat),
         # dP is in eV/Å³  →  β·dP is dimensionless  ✓
         prefactor = self.barostat_compressibility * dt / (3.0 * self.barostat_tau)
+        #prefactor = self.barostat_compressibility * dt / (1.0 * self.barostat_tau) #testing
 
         if self.barostat_isotropic:
             dP = self.target_pressure - P_scalar  # eV/Å³
@@ -275,6 +370,8 @@ class MDXL:
             diag_P = torch.diagonal(P_inst)  # (3,) eV/Å³
             dP = self.target_pressure - diag_P
             mu_diag = (1.0 - prefactor * dP) ** (1.0 / 3.0)
+            #mu_diag[0] = 1.0
+            #mu_diag[2] = 1.0
 
             structure.cell = structure.cell * mu_diag.unsqueeze(-1)
             structure.cell_inv = torch.linalg.inv(structure.cell)
@@ -1082,7 +1179,11 @@ class MDXL:
 
         # ── Berendsen barostat: rescale cell + positions ─────────────────
         if self.barostat_enabled:
-            self._barostat_scale(structure, dt)
+            if self.barostat_stochastic:
+                print('Utilizing stochastic barostat')
+                self._stochastic_barostat_scale(structure, dt)
+            else:
+                self._barostat_scale(structure, dt)
             V = torch.abs(torch.det(structure.cell))
             self.P_array = torch.cat(
                 (self.P_array, self._P_inst_GPa.detach().unsqueeze(0)), dim=0
@@ -2035,13 +2136,6 @@ def initialize_velocities_batch(
     ang2m = 1e-10
     fs2s = 1e-15
     eC = 1.602176634e-19
-    MVV2KE = (amu_kg * (ang2m / fs2s) ** 2) / eC  # ≈ 103.642691 eV per (amu * (Å/fs)^2)
-
-    # Sampling stddev (0 for_ zero-mass)
-    kT = torch.as_tensor(kB_eV_per_K * temperature_K, device=device, dtype=dtype)
-    inv_m = torch.where(mpos, 1.0 / masses_amu, torch.zeros_like(masses_amu))
-    std = torch.sqrt(torch.clamp(kT.unsqueeze(-1) * inv_m / MVV2KE, min=0)).to(dtype)
-
     # Sample velocities
     g = generator if generator is not None else None
     V = (
