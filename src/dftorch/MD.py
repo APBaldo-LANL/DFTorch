@@ -77,6 +77,7 @@ class MDXL:
         self.barostat_compressibility = (
             4.57e-5  # compressibility in 1/GPa (water default)
         )
+        self.barostat_stochastic = False
         self.P_array = None  # pressure history
         self.V_array = None  # volume history
 
@@ -162,6 +163,7 @@ class MDXL:
         tau: float = 100.0,
         isotropic: bool = True,
         compressibility: float = 4.57e-5,
+        stochastic = False,
     ):
         """
         Enable Berendsen barostat for NPT ensemble.
@@ -194,6 +196,8 @@ class MDXL:
         self.barostat_isotropic = isotropic
         # Convert compressibility from 1/bar → Å³/eV for internal use
         self.barostat_compressibility = compressibility * bar_per_eVA3  # Å³/eV
+        if stochastic:
+            self.barostat_stochastic = True
 
     def _compute_stress_tensor(self, structure, dftorch_params):
         """
@@ -241,6 +245,93 @@ class MDXL:
         mvv = torch.einsum("i,ia,ib->ab", mass, vel, vel)  # (3,3)
         sigma_kin = (2.0 * self.MVV2KE * mvv) / V
         return sigma_kin  # eV/Å³
+
+    def _stochastic_barostat_scale(self, structure, dt):
+        """
+        Apply Stochastic 'Berendsen' barostat scaling to cell and
+            positions.
+
+        Scaling factor:
+                      'Berendsen' term           +       Stochastic term
+          μ = (β dt / (τ_P)) (P_target - P_inst) + [(2 kb T β) / (V τ_P)]^(1/2) dW
+          dW = Wiener noise
+
+        For non-scaled momenta w/ COM contribution:
+          P_inst = (N Kb T) / (V) - σ_pot
+        """
+        kB_eV = 8.617333262145e-5  # eV/K
+        T = (
+            self.temperature_K.item()
+            if hasattr(self.temperature_K, "item")
+            else float(self.temperature_K)
+        )
+        N = structure.Mnuc.size(0)
+        V = torch.abs(torch.det(structure.cell))
+
+        sigma_pot = self._compute_stress_tensor(structure, self._dftorch_params)
+        # Derive kinetic stress from <KE>, not inst.
+        sigma_kin = torch.ones_like(sigma_pot)
+        kin_factor = (N * kB_eV  * T) / V
+        sigma_kin = sigma_kin * kin_factor
+
+        P_inst = sigma_kin - sigma_pot
+
+        P_scalar = torch.trace(P_inst) / 3.0
+        GPa_per_eVA3 = 160.21766208
+
+        # Store for_ logging (GPa)
+        self._P_inst_GPa = P_scalar * GPa_per_eVA3
+        self._P_tensor = P_inst * GPa_per_eVA3
+
+        prefactor = -1.0 * self.barostat_compressibility * dt / self.barostat_tau
+
+        #Compute the stochastic term. For Anisotropic, should be computed indepepdently for each dim. 
+        stochastic_factor = ( (2 * kB_eV * T * self.barostat_compressibility) / (V * self.barostat_tau) ) ** (1.0 / 2.0)
+        stochastic_term = stochastic_factor * torch.randn(1, device=structure.cell.device)
+
+        dP = self.target_pressure - P_scalar  # eV/Å³
+
+        #Scaling Factor
+        mu = torch.exp(
+                (prefactor * dP) + stochastic_term
+                ) ** (1.0 / 3.0)
+
+        mu_t = torch.tensor(
+                mu, dtype=structure.cell.dtype, device=structure.cell.device
+            )
+
+
+        structure.cell = structure.cell * mu_t
+        structure.cell_inv = torch.linalg.inv(structure.cell)
+
+        structure.RX = structure.RX * mu_t
+        structure.RY = structure.RY * mu_t
+        structure.RZ = structure.RZ * mu_t
+
+        # Wrap positions after rescaling
+        R = torch.stack((structure.RX, structure.RY, structure.RZ), dim=-1)
+        R = wrap_positions(R, structure.cell, structure.cell_inv)
+        structure.RX, structure.RY, structure.RZ = R.unbind(dim=-1)
+
+        # Rebuild PME data for the new cell (if using PME Coulomb)
+        if self._dftorch_params["COUL_METHOD"] == "PME":
+            from .ewald_pme import (
+                calculate_alpha_and_num_grids,
+                init_PME_data,
+            )
+
+            self.CALPHA, grid_dimensions = calculate_alpha_and_num_grids(
+                structure.cell.detach().cpu().numpy(),
+                self._dftorch_params["COULOMB_CUTOFF"],
+                self._dftorch_params.get("COULOMB_ACC", 1e-5),
+            )
+            self.PME_data = init_PME_data(
+                grid_dimensions,
+                structure.cell,
+                self.CALPHA,
+                self._dftorch_params.get("PME_ORDER", 4),
+            )
+
 
     def _barostat_scale(self, structure, dt):
         """
@@ -1162,7 +1253,10 @@ class MDXL:
 
         # ── Berendsen barostat: rescale cell + positions ─────────────────
         if self.barostat_enabled:
-            self._barostat_scale(structure, dt)
+            if self.barostat_stochastic:
+                self._stochastic_barostat_scale(structure, dt)
+            else:
+                self._barostat_scale(structure, dt)
             V = torch.abs(torch.det(structure.cell))
             self.P_array = torch.cat(
                 (self.P_array, self._P_inst_GPa.detach().unsqueeze(0)), dim=0
