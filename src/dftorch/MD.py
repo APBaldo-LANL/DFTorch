@@ -234,7 +234,7 @@ class MDXL:
         sigma_kin = (2.0 * self.MVV2KE * mvv) / V
         return sigma_kin  # eV/Å³
 
-    def _stochastic_barostat_scale(self, structure, dt):
+    def _stochastic_barostat_scale(self, structure, dt, md_step):
         """
         Apply Stochastic 'Berendsen' barostat scaling to cell and
             positions.
@@ -276,50 +276,50 @@ class MDXL:
         prefactor = -1.0 * self.barostat_compressibility * dt / self.barostat_tau
         stochastic_factor = ( (2 * kB_eV * T * self.barostat_compressibility) / (V * self.barostat_tau) ) ** (1.0 / 2.0)
 
-        stochastic_term = stochastic_factor * torch.randn(1)
+        stochastic_term = stochastic_factor * torch.randn(1, device=structure.cell.device)
         #print('stochastic_factor',stochastic_factor)
         #print('stochastic_term',stochastic_term)
 
         dP = self.target_pressure - P_scalar  # eV/Å³
+        if md_step % 100 == 0:
+            mu = torch.exp(
+                    (prefactor * dP) + stochastic_term
+                    ) ** (1.0 / 3.0)
 
-        mu = torch.exp(
-                (prefactor * dP) + stochastic_term
-                ) ** (1.0 / 3.0)
+            mu_t = torch.tensor(
+                    mu, dtype=structure.cell.dtype, device=structure.cell.device
+                )
 
-        mu_t = torch.tensor(
-                mu, dtype=structure.cell.dtype, device=structure.cell.device
-            )
+            structure.cell = structure.cell * mu_t
+            structure.cell_inv = torch.linalg.inv(structure.cell)
 
-        structure.cell = structure.cell * mu_t
-        structure.cell_inv = torch.linalg.inv(structure.cell)
+            structure.RX = structure.RX * mu_t
+            structure.RY = structure.RY * mu_t
+            structure.RZ = structure.RZ * mu_t
 
-        structure.RX = structure.RX * mu_t
-        structure.RY = structure.RY * mu_t
-        structure.RZ = structure.RZ * mu_t
+            # Wrap positions after rescaling
+            R = torch.stack((structure.RX, structure.RY, structure.RZ), dim=-1)
+            R = wrap_positions(R, structure.cell, structure.cell_inv)
+            structure.RX, structure.RY, structure.RZ = R.unbind(dim=-1)
 
-        # Wrap positions after rescaling
-        R = torch.stack((structure.RX, structure.RY, structure.RZ), dim=-1)
-        R = wrap_positions(R, structure.cell, structure.cell_inv)
-        structure.RX, structure.RY, structure.RZ = R.unbind(dim=-1)
+            # Rebuild PME data for_ the new cell (if using PME Coulomb)
+            if self._dftorch_params["coul_method"] == "PME":
+                from .ewald_pme import (
+                    init_PME_data,
+                    calculate_alpha_and_num_grids,
+                )
 
-        # Rebuild PME data for_ the new cell (if using PME Coulomb)
-        if self._dftorch_params["coul_method"] == "PME":
-            from .ewald_pme import (
-                init_PME_data,
-                calculate_alpha_and_num_grids,
-            )
-
-            self.CALPHA, grid_dimensions = calculate_alpha_and_num_grids(
-                structure.cell.detach().cpu().numpy(),
-                self._dftorch_params["cutoff"],
-                self._dftorch_params["Coulomb_acc"],
-            )
-            self.PME_data = init_PME_data(
-                grid_dimensions,
-                structure.cell,
-                self.CALPHA,
-                self._dftorch_params["PME_order"],
-            )
+                self.CALPHA, grid_dimensions = calculate_alpha_and_num_grids(
+                    structure.cell.detach().cpu().numpy(),
+                    self._dftorch_params["cutoff"],
+                    self._dftorch_params["Coulomb_acc"],
+                )
+                self.PME_data = init_PME_data(
+                    grid_dimensions,
+                    structure.cell,
+                    self.CALPHA,
+                    self._dftorch_params["PME_order"],
+                )
 
 
     def _barostat_scale(self, structure, dt):
@@ -345,6 +345,7 @@ class MDXL:
         # Store for_ logging (GPa)
         self._P_inst_GPa = P_scalar * GPa_per_eVA3
         self._P_tensor = P_inst * GPa_per_eVA3
+        print('inst Pressure tensor', self._P_tensor)
 
         # Berendsen prefactor: β dt / (3 τ_P)
         # β is in Å³/eV (converted from 1/bar in enable_barostat),
@@ -370,8 +371,8 @@ class MDXL:
             diag_P = torch.diagonal(P_inst)  # (3,) eV/Å³
             dP = self.target_pressure - diag_P
             mu_diag = (1.0 - prefactor * dP) ** (1.0 / 3.0)
-            #mu_diag[0] = 1.0
-            #mu_diag[2] = 1.0
+            mu_diag[0] = 1.0
+            mu_diag[2] = 1.0
 
             structure.cell = structure.cell * mu_diag.unsqueeze(-1)
             structure.cell_inv = torch.linalg.inv(structure.cell)
@@ -422,14 +423,70 @@ class MDXL:
         # Store params for_ barostat (needs them during step)
         self._dftorch_params = dftorch_params
 
-        if self.VX is None:
+        #if self.VX is None:
+            #try:
+            #print(dftorch_params['TEMP_GROUPS'])
+            #temp_groups = torch.tensor(dftorch_params['TEMP_GROUPS'], device=structure.cell.device)
+            #i = 0
+            #for group in temp_groups:
+            #    group_start = group[0]
+            #    group_end = group[1]
+            #    self.VX[group_start:group_end], self.VY[group_start:group_end], self.VZ[group_start:group_end] = initialize_velocities(
+            #        structure,
+            #        temperature_K=self.temperature_K[i],
+            #        remove_com=True,
+            #        rescale_to_T=True,
+            #        remove_angmom=True,
+            #    )
+            #    i = i+1
+            #except:
+            #print("No temperature groups, setting global system temperature")
+            #self.VX, self.VY, self.VZ = initialize_velocities(
+            #    structure,
+            #    temperature_K=self.temperature_K,
+            #    remove_com=True,
+            #    rescale_to_T=True,
+            #    remove_angmom=True,
+            #)
+        if self.VX is None and len(self.temperature_K) > 1:
+            # set whole system initial velocites to first temp
             self.VX, self.VY, self.VZ = initialize_velocities(
                 structure,
-                temperature_K=self.temperature_K,
+                temperature_K=self.temperature_K[0],
                 remove_com=True,
                 rescale_to_T=True,
                 remove_angmom=True,
             )
+            print(self.VX.shape)
+            temp_groups = torch.tensor(dftorch_params['TEMP_GROUPS'], device=structure.cell.device)
+            #print(temp_groups)
+            #print(temp_groups[1:,:]) # ignore 1st group
+            for remaining_groups in temp_groups[1:,:]:
+                group_start = remaining_groups[0] - 1
+                group_end = remaining_groups[1]
+                print(f'group start {group_start} group end {group_end}')
+                vx, vy, vz = initialize_velocities(
+                    structure,
+                    temperature_K=self.temperature_K[1],
+                    remove_com=True,
+                    rescale_to_T=True,
+                    remove_angmom=True,
+                )
+                print(self.VX)
+                self.VX[group_start:group_end] = vx[group_start:group_end]
+                self.VY[group_start:group_end] = vy[group_start:group_end]
+                self.VZ[group_start:group_end] = vz[group_start:group_end]
+                print(self.VX)
+        else:
+            self.VX, self.VY, self.VZ = initialize_velocities(
+                structure,
+                temperature_K=self.temperature_K[0],
+                remove_com=True,
+                rescale_to_T=True,
+                remove_angmom=True,
+            )
+
+
 
         # Propagated charge variable: atom-resolved q (CS) or shell-resolved
         # q_spin_sr of shape (2, Nshells) (OS).
@@ -1181,7 +1238,7 @@ class MDXL:
         if self.barostat_enabled:
             if self.barostat_stochastic:
                 print('Utilizing stochastic barostat')
-                self._stochastic_barostat_scale(structure, dt)
+                self._stochastic_barostat_scale(structure, dt, md_step)
             else:
                 self._barostat_scale(structure, dt)
             V = torch.abs(torch.det(structure.cell))

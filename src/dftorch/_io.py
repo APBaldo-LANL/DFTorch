@@ -150,7 +150,7 @@ SYMBOL_TO_NUMBER = {
 NUMBER_TO_SYMBOL = {v: k for k, v in SYMBOL_TO_NUMBER.items()}
 
 
-def write_pdb_frame(filename, structure, cell=None, step=0, comment="", mode="a"):
+def write_pdb_frame(filename, structure, cell=None, step=0, comment=" ", mode="a"):
     """
     Append one MD frame to a PDB trajectory file.
     Each frame is wrapped in MODEL/ENDMDL records — readable by PyMOL, VMD, Chimera.
