@@ -25,6 +25,7 @@ from ._xl_tools import (
 )
 from .ESDriver import ESDriverBatch
 
+from ._plumed import *
 
 class MDXL:
     """Extended-Lagrangian Born–Oppenheimer MD for closed- and open-shell systems.
@@ -104,6 +105,8 @@ class MDXL:
         self._os: bool = False  # open-shell flag
         self.atom_ids_sr = None  # shell-resolved atom ids (os only)
         self.shell_to_atom = None  # shell→atom mapping     (os only)
+
+        self.plumed = None
 
     def enable_langevin(self, gamma: float):
         """
@@ -539,6 +542,15 @@ class MDXL:
             self._P_tensor = torch.zeros(3, 3, device=structure.device)
 
         self.EPOT = structure.e_tot
+
+        if self._dftorch_params["PLUMED_INTERFACE"]:
+            #print("timestep", dt)
+            self.plumed = initialize_plumed(
+                natoms=structure.Nats,
+                timestep=dt,
+                plumed_input='plumed.dat',
+            )
+
         for md_step in range(num_steps):
             self.step(
                 structure, dftorch_params, md_step, dt, dump_interval, traj_filename
@@ -1227,6 +1239,24 @@ class MDXL:
             structure.f_tot = structure.f_tot + structure.f_d3
         else:
             structure.e_d3 = 0.0
+
+
+        # ── Plumed energy + forces ──────────────────────────────────
+        if dftorch_params["PLUMED_INTERFACE"]:
+            print('Calculating plumed energy+forces')
+            plumed_energy, plumed_forces = compute_plumed_bias(
+                self.plumed,
+                torch.stack((structure.RX,structure.RY,structure.RZ), dim=-1),
+                structure.cell,
+                structure.Mnuc,
+                structure.q
+            )
+            print("meta energies: ", plumed_energy)
+            print("meta forces: ", plumed_forces)
+            structure.e_tot = structure.e_tot + plumed_energy
+            plumed_forces = plumed_forces.T
+            structure.f_tot = structure.f_tot + plumed_forces
+
 
         self.EPOT = structure.e_tot
 
